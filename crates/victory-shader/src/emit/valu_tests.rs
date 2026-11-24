@@ -151,7 +151,6 @@ fn lower_cs_wave(words: &[u32], wave64: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        options: super::TranslateOptions::default(),
     })
     .expect("lower");
 
