@@ -1191,7 +1191,14 @@ fn describe(view: Option<&View>) -> String {
     match view {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
+            .unwrap_or_else(|| {
+                // LOKALNA DIAGNOSTYKA (gpu-189): format widoku (slowo 0 opisu, juz w ukladzie PC)
+                let f = match v {
+                    View::Shader(_, Some(d)) => crate::resource::pc_format(d[0]) as i64,
+                    _ => -1,
+                };
+                format!("buffer {:?} f{f}", crate::descriptor::host::buffer_range(v))
+            }),
         Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",

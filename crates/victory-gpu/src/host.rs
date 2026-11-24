@@ -207,6 +207,26 @@ fn create() -> windows::core::Result<Host> {
                 tracing::info!("GPU-based validation on");
             }
         }
+        // LOKALNA DIAGNOSTYKA (gpu-189): VICTORY_PIX=1 laduje WinPixGpuCapturer.dll z najnowszej instalacji
+        // PIX przed utworzeniem urzadzenia, zeby `pixtool attach <pid> take-capture` mogl przechwycic klatke.
+        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_PIX").is_some() {
+            use std::os::windows::ffi::OsStrExt;
+            let newest = std::fs::read_dir(r"C:\Program Files\Microsoft PIX")
+                .ok()
+                .and_then(|d| d.filter_map(|e| e.ok().map(|e| e.path())).max());
+            match newest.map(|d| d.join("WinPixGpuCapturer.dll")) {
+                Some(dll) if dll.is_file() => {
+                    let wide: Vec<u16> = dll.as_os_str().encode_wide().chain(Some(0)).collect();
+                    match windows::Win32::System::LibraryLoader::LoadLibraryW(windows::core::PCWSTR(
+                        wide.as_ptr(),
+                    )) {
+                        Ok(_) => tracing::warn!(dll = %dll.display(), "PIX GPU capturer loaded"),
+                        Err(e) => tracing::warn!(error = %e, "PIX GPU capturer did not load"),
+                    }
+                }
+                _ => tracing::warn!("PIX GPU capturer not found"),
+            }
+        }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
         if dred_on() {
@@ -1694,6 +1714,20 @@ impl Host {
             }
         }
         let state = D3D12_RESOURCE_STATES(state as i32);
+        // LOKALNA DIAGNOSTYKA (gpu-189): z VICTORY_PIX=1 nic nie pisze do bufora lancucha wymiany (PIX odmawia
+        // przechwytywania, gdy lista pisze do bufora, ktory wedlug niego nie jest biezacy); Present zostaje,
+        // bo wyznacza PIX-owi granice klatek. Okno jest wtedy czarne.
+        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_PIX").is_some() {
+            let _ = (texture, state, frame);
+            static LAST_DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let drawn = crate::draw::drawn();
+            let draws = drawn.saturating_sub(LAST_DRAWN.swap(drawn, Ordering::Relaxed));
+            // SAFETY: our swap chain.
+            let _ = unsafe { p.swap_chain.Present(0, DXGI_PRESENT(0)) };
+            pix_auto_capture(draws);
+            p.meter.frame(p.hwnd);
+            return Some(false);
+        }
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -1784,6 +1818,41 @@ impl Host {
                 meter: Meter::new(),
             })
         }
+    }
+}
+
+/// LOKALNA DIAGNOSTYKA (gpu-189): przechwycenie programowe PIX (`pixtool launch ... programmatic-capture`).
+/// Z VICTORY_PIX_AUTO=<prog> pierwsza klatka, ktora narysowala co najmniej <prog> rysowan (swiat), zaczyna
+/// przechwytywanie po swoim Present, a nastepny Present je konczy: PIX dostaje jedna pelna klatke swiata.
+fn pix_auto_capture(draws: u64) {
+    static STATE: AtomicU32 = AtomicU32::new(0); // 0 czeka, 1 przechwytuje, 2 skonczone
+    let Some(threshold) = std::env::var("VICTORY_PIX_AUTO").ok().and_then(|v| v.parse::<u64>().ok()) else {
+        return;
+    };
+    // SAFETY: the DXGI debug interface PIX's capturer provides; absent without it.
+    let analysis = || unsafe { DXGIGetDebugInterface1::<IDXGraphicsAnalysis>(0).ok() };
+    match STATE.load(Ordering::Relaxed) {
+        0 if draws >= threshold => match analysis() {
+            Some(a) => {
+                // SAFETY: as above.
+                unsafe { a.BeginCapture() };
+                STATE.store(1, Ordering::Relaxed);
+                tracing::warn!(draws, "PIX: programmatic capture begins");
+            }
+            None => {
+                STATE.store(2, Ordering::Relaxed);
+                tracing::warn!("PIX: no IDXGraphicsAnalysis (not launched by pixtool?)");
+            }
+        },
+        1 => {
+            if let Some(a) = analysis() {
+                // SAFETY: as above.
+                unsafe { a.EndCapture() };
+            }
+            STATE.store(2, Ordering::Relaxed);
+            tracing::warn!(draws, "PIX: programmatic capture ends");
+        }
+        _ => {}
     }
 }
 

@@ -127,6 +127,9 @@ impl Shader {
                             if wanted {
                                 let path = std::path::Path::new(&dir).join(format!("{hash}.{}.dxil", self.stage));
                                 let _ = std::fs::write(path, &t.host.dxil);
+                                // kontener konsoli: `victory shader-info --disasm <plik>` pokazuje kod RDNA2
+                                let path = std::path::Path::new(&dir).join(format!("{hash}.{}.cont", self.stage));
+                                let _ = std::fs::write(path, &self.container);
                             }
                         }
                     }
