@@ -973,6 +973,10 @@ impl Drop for Resource {
                 );
             }
         }
+        // A running submission may still read the host copy.
+        if let Some(host) = self.host.take() {
+            crate::host::retire(host);
+        }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
