@@ -559,6 +559,31 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// The part a `ds_read` of a byte or half reads, from what follows
+/// `ds_read`: (bits, sign-extended). `None` for other widths and for the
+/// d16 forms, which write half of the register and keep the other.
+fn lds_read_part(rest: &str) -> Option<(u32, bool)> {
+    match rest {
+        "_u8" => Some((8, false)),
+        "_i8" => Some((8, true)),
+        "_u16" => Some((16, false)),
+        "_i16" => Some((16, true)),
+        _ => None,
+    }
+}
+
+/// The part a `ds_write` of a byte or half writes, from what follows
+/// `ds_write`: (bits, taken from the data's high half).
+fn lds_write_part(rest: &str) -> Option<(u32, bool)> {
+    match rest {
+        "_b8" => Some((8, false)),
+        "_b16" => Some((16, false)),
+        "_b8_d16_hi" => Some((8, true)),
+        "_b16_d16_hi" => Some((16, true)),
+        _ => None,
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
         let p = x.p;
@@ -2813,6 +2838,19 @@ impl<'a> Lower<'a> {
             let lds = l.s.lds();
             l.s.m.element(c, lds, index)
         };
+        // A byte or half: its dword, and the part's bit offset in it (the
+        // address taken as aligned to the part's size).
+        let part = |l: &mut Self, bytes: u32| -> (V, V) {
+            let c = l.cur;
+            let o = l.s.m.i32(bytes);
+            let at = l.s.m.bin(c, Bin::Add, a, o);
+            let (two, three) = (l.s.m.i32(2), l.s.m.i32(3));
+            let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let lds = l.s.lds();
+            let p = l.s.m.element(c, lds, index);
+            let byte = l.s.m.bin(c, Bin::And, at, three);
+            (p, l.s.m.bin(c, Bin::Shl, byte, three))
+        };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
             Some("b96") => 3,
@@ -2835,7 +2873,21 @@ impl<'a> Lower<'a> {
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
             } else {
-                return Err("an LDS read of bytes or halves");
+                // A byte or half, zero- or sign-extended to the dword. The
+                // d16 forms, which keep half of the register, are not done.
+                let (bits, signed) =
+                    lds_read_part(rest).ok_or("an LDS read into half a register")?;
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                let (p, shift) = part(self, offset);
+                let c = self.cur;
+                let word = self.s.m.load(c, p);
+                let x = self.s.m.bin(c, Bin::LShr, word, shift);
+                let up = self.s.m.i32(32 - bits);
+                let x = self.s.m.bin(c, Bin::Shl, x, up);
+                let down = if signed { Bin::AShr } else { Bin::LShr };
+                let x = self.s.m.bin(c, down, x, up);
+                self.write(inst, Reg::V(reg), x, guard);
+                return Ok(());
             };
             let reg = dst_reg.ok_or("an LDS read result")?;
             let mut n = 0;
@@ -2855,7 +2907,32 @@ impl<'a> Lower<'a> {
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
             } else {
-                return Err("an LDS write of bytes or halves");
+                // A byte or half of the data (its high half with d16_hi)
+                // into its dword. Two atomics, so that lanes writing the
+                // other parts of the same dword keep theirs: one clears the
+                // part, one sets it.
+                let (bits, high) = lds_write_part(rest).ok_or("an LDS write of this width")?;
+                let x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                let (p, shift) = part(self, offset);
+                let c = self.cur;
+                let x = if high {
+                    let k16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::LShr, x, k16)
+                } else {
+                    x
+                };
+                let ones = self.s.m.i32(if bits == 8 { 0xFF } else { 0xFFFF });
+                let x = self.s.m.bin(c, Bin::And, x, ones);
+                let set = self.s.m.bin(c, Bin::Shl, x, shift);
+                let mask = self.s.m.bin(c, Bin::Shl, ones, shift);
+                let all = self.s.m.i32(u32::MAX);
+                let keep = self.s.m.bin(c, Bin::Xor, mask, all);
+                let at = self.begin_guarded(guard);
+                use super::bitcode::Rmw;
+                self.s.m.atomic(self.cur, Rmw::And, p, keep);
+                self.s.m.atomic(self.cur, Rmw::Or, p, set);
+                self.end_guarded(at, &[]);
+                return Ok(());
             };
             let mut stores = Vec::new();
             for (e, (off, w)) in elements.into_iter().enumerate() {
@@ -8599,6 +8676,51 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    /// DS `op vdst, vaddr, vdata0 offset:offset`.
+    const fn ds(op: u32, vdst: u32, addr: u32, data0: u32, offset: u32) -> [u32; 2] {
+        [
+            0x36 << 26 | op << 18 | offset,
+            vdst << 24 | data0 << 8 | addr,
+        ]
+    }
+
+    /// One 512-byte block of LDS.
+    const LDS_512: u32 = 1 << 15;
+
+    #[test]
+    fn lds_bytes_and_halves_lower() {
+        let mut words = vec![
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E04_02C1, // v_mov_b32 v2, -1
+        ];
+        // ds_write_b8, ds_write_b16, ds_write_b8_d16_hi, ds_write_b16_d16_hi
+        for (op, offset) in [(0x1e, 1), (0x1f, 2), (0xa0, 3), (0xa1, 0)] {
+            words.extend(ds(op, 0, 5, 2, offset));
+        }
+        // ds_read_i8, ds_read_u8, ds_read_i16, ds_read_u16, each stored back
+        // (ds_write_b32) so that the read has an effect.
+        for (i, op) in [0x39, 0x3a, 0x3b, 0x3c].into_iter().enumerate() {
+            words.extend(ds(op, 3, 5, 0, 2));
+            words.extend(ds(0x0d, 0, 5, 3, 4 + 4 * i as u32));
+        }
+        words.push(S_ENDPGM);
+        lowers(&words, LDS_512).unwrap();
+    }
+
+    #[test]
+    fn lds_reads_into_half_a_register_are_refused() {
+        let mut words = vec![0x7E0A_0280]; // v_mov_b32 v5, 0
+        words.extend(ds(0xa6, 3, 5, 0, 2)); // ds_read_u16_d16 v3, v5 offset:2
+        words.extend(ds(0x0d, 0, 5, 3, 4)); // ds_write_b32 v5, v3 offset:4
+        words.push(S_ENDPGM);
+        match lowers(&words, LDS_512) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(what, "an LDS read into half a register");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

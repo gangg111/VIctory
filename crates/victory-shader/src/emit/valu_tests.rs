@@ -65,14 +65,31 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
+/// DS `op vdst, vaddr, vdata0 offset:offset`.
+const fn ds(op: u8, vdst: u8, addr: u8, data0: u8, offset: u16) -> [u32; 2] {
+    [
+        0x36 << 26 | (op as u32) << 18 | offset as u32,
+        (vdst as u32) << 24 | (data0 as u32) << 8 | addr as u32,
+    ]
+}
+
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
-    build_valu_cs_wave(body, false)
+    build_cs_wave(body, 0, false)
 }
 
 fn build_valu_cs_wave(body: &[u32], wave64: bool) -> HostShader {
+    build_cs_wave(body, 0, wave64)
+}
+
+/// As [`build_valu_cs`], with `lds_bytes` of LDS (a multiple of 512).
+fn build_cs(body: &[u32], lds_bytes: u32) -> HostShader {
+    build_cs_wave(body, lds_bytes, false)
+}
+
+fn build_cs_wave(body: &[u32], lds_bytes: u32, wave64: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -85,7 +102,7 @@ fn build_valu_cs_wave(body: &[u32], wave64: bool) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
-    lower_cs_wave(&words, wave64)
+    lower_cs_lds(&words, lds_bytes, wave64)
 }
 
 /// Lowers `words` as a 1-thread compute program with [`build_valu_cs`]'s
@@ -96,6 +113,10 @@ fn lower_cs(words: &[u32]) -> HostShader {
 }
 
 fn lower_cs_wave(words: &[u32], wave64: bool) -> HostShader {
+    lower_cs_lds(words, 0, wave64)
+}
+
+fn lower_cs_lds(words: &[u32], lds_bytes: u32, wave64: bool) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -130,7 +151,8 @@ fn lower_cs_wave(words: &[u32], wave64: bool) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            // 5 user SGPRs (s0..s4); LDS_SIZE in 512-byte blocks.
+            rsrc2: 5 << 1 | (lds_bytes / 512) << 15,
             threads: [1, 1, 1],
         }),
         code,
@@ -190,11 +212,23 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
-    mut check: impl FnMut(&str, usize, [u32; 4], u32),
+    check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    let ran = run_cases_on(&[("hardware", false), ("warp", true)], shader, cases, check);
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// As [`run_cases`], on the listed hosts (label, WARP); returns how many
+/// were available.
+fn run_cases_on(
+    backends: &[(&str, bool)],
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    mut check: impl FnMut(&str, usize, [u32; 4], u32),
+) -> usize {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for &(label, warp) in backends {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -228,7 +262,7 @@ fn run_cases(
         }
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    ran
 }
 
 fn is_f16_nan(bits: u16) -> bool {
@@ -1080,6 +1114,93 @@ fn uniform_select_masks_match_rdna2() {
         run_cases(shader, &inputs, |backend, _, inp, got| {
             let want = if pick_hi { inp[3] } else { inp[2] };
             assert_eq!(got, want, "{backend}: {name}({inp:?})");
+        });
+    }
+}
+
+/// LDS writes of a byte or half replace only that part of the dword (the
+/// d16_hi forms write the data's high half); reads of one zero- or
+/// sign-extend it.
+#[test]
+fn lds_bytes_and_halves_match_rdna2() {
+    const V_MOV_B32: u16 = 0x001;
+    const ZERO: u16 = 0x80; // inline constant 0
+    const DS_WRITE_B32: u8 = 0x0d;
+    const DS_READ_B32: u8 = 0x36;
+    let cases: &[[u32; 4]] = &[
+        [0x1122_3344, 0xA5B6_C7D8, 0, 0],
+        [0xFFFF_FFFF, 0x0000_0000, 0, 0],
+        [0x8070_6050, 0x7F80_FF01, 0, 0],
+    ];
+    // Hardware only: WARP refuses the compute pipeline of any program with
+    // LDS from this harness (a plain ds_write_b32/ds_read_b32 one too).
+    const HOSTS: &[(&str, bool)] = &[("hardware", false)];
+    // v5 = 0; LDS dword 0 = v1; then `op` at `offset`.
+    let prologue = |words: &mut Vec<u32>| {
+        words.push(vop1(V_MOV_B32, 5, ZERO));
+        words.extend_from_slice(&ds(DS_WRITE_B32, 0, 5, 1, 0));
+    };
+
+    type Write = fn(u32, u32) -> u32;
+    let writes: &[(&str, u8, u16, Write)] = &[
+        ("ds_write_b8 offset:1", 0x1e, 1, |w, d| {
+            w & !0xFF00 | (d & 0xFF) << 8
+        }),
+        ("ds_write_b8 offset:3", 0x1e, 3, |w, d| {
+            w & 0x00FF_FFFF | (d & 0xFF) << 24
+        }),
+        ("ds_write_b16 offset:0", 0x1f, 0, |w, d| {
+            w & 0xFFFF_0000 | d & 0xFFFF
+        }),
+        ("ds_write_b16 offset:2", 0x1f, 2, |w, d| {
+            w & 0xFFFF | (d & 0xFFFF) << 16
+        }),
+        ("ds_write_b8_d16_hi offset:2", 0xa0, 2, |w, d| {
+            w & 0xFF00_FFFF | (d >> 16 & 0xFF) << 16
+        }),
+        ("ds_write_b16_d16_hi offset:0", 0xa1, 0, |w, d| {
+            w & 0xFFFF_0000 | d >> 16
+        }),
+    ];
+    for &(what, op, offset, want) in writes {
+        let mut body = Vec::new();
+        prologue(&mut body);
+        body.extend_from_slice(&ds(op, 0, 5, 2, offset));
+        body.extend_from_slice(&ds(DS_READ_B32, 0, 5, 0, 0));
+        let shader = build_cs(&body, 512);
+        let ran = run_cases_on(HOSTS, &shader, cases, |backend, i, [w, d, ..], got| {
+            let want = want(w, d);
+            assert_eq!(
+                got, want,
+                "{backend} case {i}: {what}: {got:#010x}, want {want:#010x}"
+            );
+        });
+        if ran == 0 {
+            eprintln!("no SM 6.6 hardware device; LDS cases skipped");
+            return;
+        }
+    }
+
+    type Read = fn(u32) -> u32;
+    let reads: &[(&str, u8, u16, Read)] = &[
+        ("ds_read_u8 offset:1", 0x3a, 1, |w| w >> 8 & 0xFF),
+        ("ds_read_i8 offset:0", 0x39, 0, |w| w as i8 as i32 as u32),
+        ("ds_read_i8 offset:3", 0x39, 3, |w| (w as i32 >> 24) as u32),
+        ("ds_read_u16 offset:2", 0x3c, 2, |w| w >> 16),
+        ("ds_read_i16 offset:0", 0x3b, 0, |w| w as i16 as i32 as u32),
+        ("ds_read_i16 offset:2", 0x3b, 2, |w| (w as i32 >> 16) as u32),
+    ];
+    for &(what, op, offset, want) in reads {
+        let mut body = Vec::new();
+        prologue(&mut body);
+        body.extend_from_slice(&ds(op, 0, 5, 0, offset));
+        let shader = build_cs(&body, 512);
+        run_cases_on(HOSTS, &shader, cases, |backend, i, [w, ..], got| {
+            let want = want(w);
+            assert_eq!(
+                got, want,
+                "{backend} case {i}: {what}: {got:#010x}, want {want:#010x}"
+            );
         });
     }
 }
