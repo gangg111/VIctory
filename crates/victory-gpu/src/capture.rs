@@ -298,6 +298,7 @@ fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
+        31 if man != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
@@ -310,6 +311,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
         0 => m / (1 << man) as f32 * 2f32.powi(-14),
+        31 if m != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
     }
@@ -382,7 +384,12 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         (0.0, finite.fold(0.0f32, f32::max))
     };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high, "target values");
+    // LOKALNA DIAGNOSTYKA (gpu-189): ile kanalow to NaN, Inf, zero i wartosci ujemne.
+    let nan = values.iter().flatten().filter(|v| v.is_nan()).count();
+    let inf = values.iter().flatten().filter(|v| v.is_infinite()).count();
+    let zero = values.iter().flatten().filter(|v| **v == 0.0).count();
+    let negative = values.iter().flatten().filter(|v| **v < 0.0).count();
+    tracing::info!(format, low, high, nan, inf, zero, negative, "target values");
     for v in values {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);

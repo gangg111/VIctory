@@ -618,7 +618,10 @@ impl State {
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            {
+                crate::pipeline::note_drop(self.pipeline as This);
+                self.note_listed(format_args!("dispatch {x}x{y}x{z}"), "no host pipeline");
+            }
             return;
         };
         if !p.compute {
@@ -643,6 +646,11 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        // LOKALNA DIAGNOSTYKA (gpu-189): w klatkach z VICTORY_CAPTURE_FRAMES opis kazdego dispatchu.
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::listed(crate::queue::presented() + 1) {
+            tracing::info!("listed dispatch ran: {}", self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1259,6 +1267,12 @@ impl State {
                 format_args!("indirect kind {kind} max {max} args {arguments:#x} count {count:x?}={value:?}"),
                 "ran",
             );
+            if kind == DISPATCH && crate::capture::listed(crate::queue::presented() + 1) {
+                tracing::info!(
+                    "listed dispatch ran: {}",
+                    self.op_text(format!("indirect kind 2 max {max} at {arguments:#x}"), true)
+                );
+            }
         }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
