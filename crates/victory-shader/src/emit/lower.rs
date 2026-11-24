@@ -347,6 +347,9 @@ enum MaskData {
     None,
 }
 
+/// What a descriptor dword with no host value (an address, a format)
+/// stops with when read as a number; the logged reason names the dword.
+const DESCRIPTOR_OTHER: Why = "a descriptor's address or format read as data";
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
@@ -3705,7 +3708,7 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
+        const OTHER: Why = DESCRIPTOR_OTHER;
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -3835,13 +3838,35 @@ impl<'a> Lower<'a> {
             }
             None => vec![(2, field(self, 0))],
         };
+        // Which dword of which kind a refused read is, for the logs: the same
+        // reason with the field named after it.
+        const IMAGE_DWORD: [Why; 8] = [
+            "a descriptor's address or format read as data (image dword 0)",
+            "a descriptor's address or format read as data (image dword 1)",
+            "a descriptor's address or format read as data (image dword 2)",
+            "a descriptor's address or format read as data (image dword 3)",
+            "a descriptor's address or format read as data (image dword 4)",
+            "a descriptor's address or format read as data (image dword 5)",
+            "a descriptor's address or format read as data (image dword 6)",
+            "a descriptor's address or format read as data (image dword 7)",
+        ];
+        const BUFFER_DWORD: [Why; 4] = [
+            "a descriptor's address or format read as data (buffer dword 0)",
+            "a descriptor's address or format read as data (buffer dword 1)",
+            "a descriptor's address or format read as data (buffer dword 2)",
+            "a descriptor's address or format read as data (buffer dword 3)",
+        ];
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
+                    let why = match image {
+                        Some(_) => IMAGE_DWORD.get(rel as usize),
+                        None => BUFFER_DWORD.get(rel as usize),
+                    };
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        self.vals.insert(v, Val::Missing(why.copied().unwrap_or(OTHER)));
                     }
                 }
             }
@@ -8447,6 +8472,17 @@ impl<'a> Lower<'a> {
                     // that edge, assuming reads come only from the data path.
                     (Some(Val::Missing(_)), false)
                         if live && has_data && self.is_mask_value(arg) =>
+                    {
+                        self.s.m.undef(self.s.t.i32)
+                    }
+                    // The same for a descriptor's address or format dword: the
+                    // console reuses its registers once the descriptor is dead
+                    // (Machad3x 9018be9, #798: 19 of the world's 21 mesh
+                    // programs on an RTX 3080 Ti).
+                    // shortcut: undefined on that edge, assuming the program
+                    // reads the joined value only on paths from a data edge.
+                    (Some(Val::Missing(why)), false)
+                        if live && has_data && why.starts_with(DESCRIPTOR_OTHER) =>
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
