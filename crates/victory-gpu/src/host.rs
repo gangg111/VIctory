@@ -1840,11 +1840,56 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-            ..Default::default()
+        // LOKALNY EKSPERYMENT A/B (gpu-189): VICTORY_SHADOW_GPU_UPLOAD=1 kladzie kopie pamieci gry w pamieci
+        // karty widocznej dla CPU (GPU upload heap, wymaga Resizable BAR) zamiast w pamieci systemowej L0,
+        // zeby sprawdzic, czy wolne programy swiata na NVIDIA czekaja na odczyty przez PCIe.
+        static GPU_UPLOAD: OnceLock<bool> = OnceLock::new();
+        let gpu_upload = *GPU_UPLOAD.get_or_init(|| {
+            if std::env::var_os("VICTORY_SHADOW_GPU_UPLOAD").is_none() {
+                return false;
+            }
+            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: the query writes the structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS16,
+                        (&raw mut o).cast(),
+                        size_of_val(&o) as u32,
+                    )
+                    .is_ok()
+            };
+            let on = ok && o.GPUUploadHeapSupported.as_bool();
+            tracing::warn!(supported = on, "shadow copies in a GPU upload heap (experiment)");
+            on
+        });
+        let heap = if gpu_upload {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+                ..Default::default()
+            }
+        } else {
+            // LOKALNY EKSPERYMENT A/B (gpu-189): VICTORY_SHADOW_WC=1 to ta sama pamiec systemowa, ale
+            // write-combine (bez koherencji z cache CPU, jak sterty uploadu): szybsza sciezka dla odczytow GPU,
+            // wolniejsza dla odczytow CPU (kopie zwrotne).
+            static WC: OnceLock<bool> = OnceLock::new();
+            let wc = *WC.get_or_init(|| {
+                let on = std::env::var_os("VICTORY_SHADOW_WC").is_some();
+                if on {
+                    tracing::warn!("shadow copies write-combined (experiment)");
+                }
+                on
+            });
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: if wc {
+                    D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE
+                } else {
+                    D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
+                },
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            }
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
