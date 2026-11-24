@@ -2000,6 +2000,111 @@ impl Host {
             }
         }
     }
+
+    /// A buffer of `size` bytes whose `backed` from `from` on are system
+    /// memory the CPU maps, as [`Host::shared_buffer`], and the rest unmapped
+    /// tiles: shaders read zeros there instead of faulting, at no memory.
+    /// Returns the buffer, a placed buffer over the backed memory that holds
+    /// the mapping (keep it alive with the first), and the mapping.
+    pub(crate) fn sparse_buffer(
+        &self,
+        size: u64,
+        from: u64,
+        backed: u64,
+    ) -> Option<(ID3D12Resource, ID3D12Resource, *mut u8)> {
+        const TILE: u64 = 64 << 10;
+        let size = size.next_multiple_of(TILE);
+        let from = (from & !(TILE - 1)).min(size - TILE);
+        let backed = backed.next_multiple_of(TILE).clamp(TILE, size - from);
+        let buffer_desc = |width: u64| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: width,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let made = (|| -> windows::core::Result<(ID3D12Resource, ID3D12Resource, *mut u8)> {
+            let mut heap: Option<ID3D12Heap> = None;
+            let mut sparse: Option<ID3D12Resource> = None;
+            let mut alias: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation of a heap and buffers on it, a mapping of
+            // the CPU-visible one, and tile mappings queued before any list
+            // that reads the buffer.
+            unsafe {
+                self.device.CreateHeap(
+                    &D3D12_HEAP_DESC {
+                        SizeInBytes: backed,
+                        Properties: D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_CUSTOM,
+                            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                            ..Default::default()
+                        },
+                        Alignment: 0,
+                        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    },
+                    &mut heap,
+                )?;
+                let heap = heap.ok_or_else(windows::core::Error::empty)?;
+                self.device.CreateReservedResource(
+                    &buffer_desc(size),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut sparse,
+                )?;
+                let sparse = sparse.ok_or_else(windows::core::Error::empty)?;
+                self.device.CreatePlacedResource(
+                    &heap,
+                    0,
+                    &buffer_desc(backed),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut alias,
+                )?;
+                let alias = alias.ok_or_else(windows::core::Error::empty)?;
+                alias.Map(0, None, Some(&mut data))?;
+                let tiles = (backed / TILE) as u32;
+                let start = D3D12_TILED_RESOURCE_COORDINATE {
+                    X: (from / TILE) as u32,
+                    ..Default::default()
+                };
+                let region = D3D12_TILE_REGION_SIZE {
+                    NumTiles: tiles,
+                    UseBox: false.into(),
+                    ..Default::default()
+                };
+                let offset = 0u32;
+                self.queue.UpdateTileMappings(
+                    &sparse,
+                    1,
+                    Some(&start),
+                    Some(&region),
+                    &heap,
+                    1,
+                    None,
+                    Some(&offset),
+                    Some(&tiles),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+                Ok((sparse, alias, data.cast()))
+            }
+        })();
+        match made {
+            Ok(made) => Some(made),
+            Err(e) => {
+                tracing::warn!(error = %e, size, backed, "no sparse buffer");
+                None
+            }
+        }
+    }
 }
 
 /// For adapters without device-removed data (the software one): the last
