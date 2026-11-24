@@ -257,8 +257,10 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
+    /// `raw`: the shader reads the slot only through raw handles (a
+    /// structured buffer view is then made raw, see `buffer_srv`).
+    pub(crate) fn make_at(&self, index: u32, view: &View, raw: bool) {
+        let kept = make(view, self.cpu(index), raw);
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
@@ -313,7 +315,7 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
-    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool, raw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -331,7 +333,8 @@ impl HostHeap {
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
-        let key = u64::from(generation) << 32 | u64::from(i);
+        // Bit 63: the view was made raw for raw-only readers (`make_at`).
+        let key = u64::from(generation) << 32 | u64::from(i) | u64::from(raw) << 63;
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -349,7 +352,7 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                make(&view, self.cpu(index))
+                make(&view, self.cpu(index), raw)
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -368,7 +371,7 @@ impl HostHeap {
         if key == 0 {
             return Some("null".into());
         }
-        let view = view_at(key as u32, (key >> 32) as u32)?;
+        let view = view_at(key as u32, (key >> 32) as u32 & 0x7FFF_FFFF)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
         if let Some((address, len)) = buffer_range(&view) {
             let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
@@ -499,14 +502,24 @@ fn buffer_srv(
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    raw: bool,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
-    // EKSPERYMENT (gpu-189): VICTORY_RAW_SRV=1 robi z widoku structured widok surowy. NVIDIA ogranicza
-    // odczyt surowy (ByteAddressBuffer, wiekszosc odczytow tlumacza) z widoku structured do
-    // NumElements * 4 bajtow (tests/d3d12_uint_view_as_float, tryb structured). Shadery czytajace
-    // te same widoki uchwytem structured zwalniaja wtedy, wiec to nie jest jeszcze poprawka.
-    let raw_srv = std::env::var_os("VICTORY_RAW_SRV").is_some_and(|v| v == "1");
-    if raw_srv {
+    // A structured view the shader reads only raw (`raw`, from the
+    // translation's `raw_views`) is made raw: NVIDIA bounds a raw read of a
+    // structured view by `NumElements * 4` bytes and reads zeros past them
+    // (an RTX 3080; WARP reads the data). A shadow cascade count past that
+    // read as 0 kept the cascade loop of GTA VI's world pixel shaders running
+    // to the loop limit. Views also read structured stay as the title made
+    // them. `VICTORY_RAW_SRV=0` turns it off, `=1` makes every structured
+    // shader resource view raw (diagnostics).
+    let mode = std::env::var("VICTORY_RAW_SRV").ok();
+    let raw = match mode.as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => raw,
+    };
+    if raw {
         // SAFETY: a buffer view's union member.
         let b = unsafe { &mut desc.Anonymous.Buffer };
         if let Some((first, count)) = raw_window(b.FirstElement, b.NumElements, b.StructureByteStride, shadow.offset(address)) {
@@ -641,7 +654,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, raw: bool) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -682,7 +695,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+                buffer_srv(data as u64, len, srv_desc(desc), at, raw)
             } else {
                 None
             }
@@ -731,7 +744,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make(&view, at, raw);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -748,7 +761,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if *unordered {
                 buffer_uav(address, len, uav_desc(words), at)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv(address, len, srv_desc(words), at, raw)
             }
         }
     }

@@ -485,7 +485,7 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.raw_views, compute);
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -644,7 +644,10 @@ impl State {
         }
     }
 
-    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
+    /// shortcut: `raw` remakes the shared heap slot as a raw view; a draw of
+    /// the same submission that reads the slot structured then reads the raw
+    /// view too (the last view made is what the GPU sees).
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool, raw: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -655,7 +658,7 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        match host.mirror(index, handle, true) {
+        match host.mirror(index, handle, true, raw) {
             Some(view) => readable(list, u, &view),
             None => self.null_uav |= u.kind == ResourceType::Uav,
         }
@@ -672,7 +675,16 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        raw_views: &[(u8, u32)],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
+        let raw = |u: &UsedResource| {
+            u.kind == ResourceType::Srv && raw_views.contains(&(u.slot, u.table_offset_dwords))
+        };
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -705,7 +717,7 @@ impl State {
         fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, compute, raw(u));
             }
         }
         let mut made = Vec::new();
@@ -772,7 +784,7 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        host.make_at(index, &view, used.is_some_and(|u| raw(u)));
                         if let Some(u) = used {
                             readable(list, u, &view);
                         }
