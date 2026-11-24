@@ -812,7 +812,15 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         }
         _ => return null_view(at),
     };
-    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    // A texture's null view takes the title's dimension: a 3D texture's
+    // writes through a 2D null view are a mismatch (GPU-based validation
+    // names it, `[compute 5bb23d336331db1d]` in GTA VI's world).
+    let dimension = match view {
+        View::Unordered(_, _, Some(d)) => d[1],
+        View::Placed(true, _, d) => d[1],
+        _ => D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32,
+    };
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_UINT,
         ViewDimension: if buffer {
             D3D12_UAV_DIMENSION_BUFFER
@@ -821,6 +829,24 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         },
         ..Default::default()
     };
+    if !buffer {
+        match D3D12_UAV_DIMENSION(dimension as i32) {
+            D3D12_UAV_DIMENSION_TEXTURE1D => desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D,
+            D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV { ArraySize: 1, ..Default::default() };
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: 1, ..Default::default() };
+            }
+            D3D12_UAV_DIMENSION_TEXTURE3D => {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                desc.Anonymous.Texture3D = D3D12_TEX3D_UAV { WSize: u32::MAX, ..Default::default() };
+            }
+            _ => {}
+        }
+    }
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
         host.device.CreateUnorderedAccessView(
