@@ -353,6 +353,9 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Conditions of `v_cndmask_b32` selects whose mask is not a lane mask
+    /// and is the same in every lane, by the value the select writes.
+    pub uniform_selects: HashMap<Value, Bool>,
 }
 
 impl Structured {
@@ -413,6 +416,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::uniform_selects`].
+    uniform_selects: Map<Value, Bool>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -476,6 +481,7 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            uniform_selects: Map::default(),
         })
     }
 
@@ -488,6 +494,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.uniform_selects.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -632,8 +639,13 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
+            uniform_selects: self.uniform_selects.into_iter().collect(),
             bools: self.b,
             exits,
             guards,
@@ -782,7 +794,8 @@ impl<'a> Lanes<'a> {
             }
         };
         Some(match *op {
-            Operand::Scalar { code, .. } if code != NULL => {
+            Operand::Scalar { code: NULL, .. } => (Bool::FALSE, false),
+            Operand::Scalar { code, .. } => {
                 let k = self.key(|r| inst.read(r), code)?;
                 self.mask(k)
             }
@@ -974,13 +987,20 @@ impl<'a> Lanes<'a> {
                     l.active.insert(k.0);
                 };
                 // A select reads a mask nothing else may: a join of compare
-                // results is resolved here, as for EXEC.
+                // results is resolved here, as for EXEC. A mask that is not
+                // derived and holds the same value in every lane is kept for
+                // the select without becoming a lane mask.
                 if name == "v_cndmask_b32"
-                    && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
-                    && code != NULL
-                    && let Some(k) = self.key(|r| inst.read(r), code)
+                    && let Some(op) = v.src.get(2)
+                    && let Some((m, false)) = self.operand(inst, op)
+                    && self
+                        .b
+                        .support(m)
+                        .iter()
+                        .all(|a| matches!(a, Atom::Uniform(_)))
+                    && let Some(&(_, dst)) = inst.writes.first()
                 {
-                    self.mask(k);
+                    self.uniform_selects.insert(dst, m);
                 }
                 if name.starts_with("v_cmpx") {
                     if let Some(k) = self.key(|r| inst.write(r), EXEC) {
@@ -1230,5 +1250,58 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn uniform_select_masks_stay_out_of_lane_masks() {
+        let wave32 = build(
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0x8502_80C1, // s_cselect_b32 s2, -1, 0
+                0xD501_0001,
+                0x0009_0503, // v_cndmask_b32 v1, v3, v2, s2
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xD501_0004,
+                0x000D_0503, // v_cndmask_b32 v4, v3, v2, s3
+                0x8F04_0081, // s_lshl_b32 s4, 1, s0
+                0xD501_0005,
+                0x0011_0503, // v_cndmask_b32 v5, v3, v2, s4
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&wave32).unwrap();
+        let scc = wave32.blocks[0].insts[0].write(Reg::Scc).unwrap();
+        let s2 = wave32.blocks[0].insts[1].write(Reg::S(2)).unwrap();
+        let v1 = wave32.blocks[0].insts[2].write(Reg::V(1)).unwrap();
+        let v4 = wave32.blocks[0].insts[4].write(Reg::V(4)).unwrap();
+        let v5 = wave32.blocks[0].insts[6].write(Reg::V(5)).unwrap();
+        assert!(!s.masks.contains_key(&s2));
+        assert_eq!(
+            s.bools.node(s.uniform_selects[&v1]),
+            Some((Atom::Uniform(scc), Bool::FALSE, Bool::TRUE))
+        );
+        assert_eq!(s.uniform_selects.get(&v4), Some(&Bool::FALSE));
+        assert!(!s.uniform_selects.contains_key(&v5));
+
+        // Wave64: overwriting the high dword breaks the uniform pair.
+        let wave64 = build(
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0x8582_80C1, // s_cselect_b64 s[2:3], -1, 0
+                0xD501_0001,
+                0x0009_0503, // v_cndmask_b32 v1, v3, v2, s[2:3]
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xD501_0004,
+                0x0009_0503, // v_cndmask_b32 v4, v3, v2, s[2:3]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s64 = structure(&wave64).unwrap();
+        let v1_64 = wave64.blocks[0].insts[2].write(Reg::V(1)).unwrap();
+        let v4_64 = wave64.blocks[0].insts[4].write(Reg::V(4)).unwrap();
+        assert!(s64.uniform_selects.contains_key(&v1_64));
+        assert!(!s64.uniform_selects.contains_key(&v4_64));
     }
 }

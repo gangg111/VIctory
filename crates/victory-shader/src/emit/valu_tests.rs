@@ -69,6 +69,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_wave(body, false)
+}
+
+fn build_valu_cs_wave(body: &[u32], wave64: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -91,7 +95,7 @@ fn lower_cs(words: &[u32]) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout: vec![
             RootParam {
@@ -986,4 +990,90 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+#[test]
+fn uniform_select_masks_match_rdna2() {
+    let sopc_eq = |a: u8, b: u8| 0xBF06_0000 | (b as u32) << 8 | a as u32;
+    let s_mov_b64 = |sdst: u8, src0: u8| 0xBE80_0400 | (sdst as u32) << 16 | src0 as u32;
+    let cnd = vop3(0x101, 0, vgpr(3), vgpr(4), sgpr(6));
+
+    // Wave32: s_cselect_b32 (-1, 0) followed by scalar s_xor_b32 reuse of the mask.
+    let csel32_pos = build_valu_cs(&[
+        sopc_eq(0, 1),             // s_cmp_eq_u32 s0, s1
+        sop2(0x0A, 6, 0xC1, 0x80), // s_cselect_b32 s6, -1, 0
+        cnd[0],
+        cnd[1],                 // v_cndmask_b32 v0, v3, v4, s6
+        sop2(0x12, 7, 6, 0x81), // s_xor_b32 s7, s6, 1
+        0x4A00_0007,            // v_add_nc_u32 v0, s7, v0
+    ]);
+    // Wave32: s_cselect_b32 (0, -1).
+    let csel32_neg = build_valu_cs(&[
+        sopc_eq(0, 1),             // s_cmp_eq_u32 s0, s1
+        sop2(0x0A, 6, 0x80, 0xC1), // s_cselect_b32 s6, 0, -1
+        cnd[0],
+        cnd[1],
+    ]);
+    // Wave32: constant -1 and constant 0 masks.
+    let const32_all = build_valu_cs(&[s_mov_b32(6, 0xC1), cnd[0], cnd[1]]);
+    let const32_none = build_valu_cs(&[s_mov_b32(6, 0x80), cnd[0], cnd[1]]);
+
+    // Wave64: s_cselect_b64 (-1, 0), (0, -1), and constant -1 / 0 masks.
+    let csel64_pos = build_valu_cs_wave(
+        &[
+            sopc_eq(0, 1),
+            sop2(0x0B, 6, 0xC1, 0x80), // s_cselect_b64 s[6:7], -1, 0
+            cnd[0],
+            cnd[1],
+        ],
+        true,
+    );
+    let csel64_neg = build_valu_cs_wave(
+        &[
+            sopc_eq(0, 1),
+            sop2(0x0B, 6, 0x80, 0xC1), // s_cselect_b64 s[6:7], 0, -1
+            cnd[0],
+            cnd[1],
+        ],
+        true,
+    );
+    let const64_all = build_valu_cs_wave(&[s_mov_b64(6, 0xC1), cnd[0], cnd[1]], true);
+    let const64_none = build_valu_cs_wave(&[s_mov_b64(6, 0x80), cnd[0], cnd[1]], true);
+
+    let inputs = [
+        [7, 7, 0x1111_2222, 0xAAAA_BBBB],
+        [7, 9, 0x1111_2222, 0xAAAA_BBBB],
+        [0, 0, 0xDEAD_BEEF, 0xCAFE_F00D],
+        [1, 0, 0xDEAD_BEEF, 0xCAFE_F00D],
+    ];
+
+    run_cases(&csel32_pos, &inputs, |backend, _, inp, got| {
+        let eq = inp[0] == inp[1];
+        let picked = if eq { inp[3] } else { inp[2] };
+        let xor_mask = (if eq { u32::MAX } else { 0 }) ^ 1;
+        let want = picked.wrapping_add(xor_mask);
+        assert_eq!(got, want, "{backend}: csel32_pos({inp:?})");
+    });
+    for (name, shader, inv) in [
+        ("csel32_neg", &csel32_neg, true),
+        ("csel64_pos", &csel64_pos, false),
+        ("csel64_neg", &csel64_neg, true),
+    ] {
+        run_cases(shader, &inputs, |backend, _, inp, got| {
+            let cond = (inp[0] == inp[1]) ^ inv;
+            let want = if cond { inp[3] } else { inp[2] };
+            assert_eq!(got, want, "{backend}: {name}({inp:?})");
+        });
+    }
+    for (name, shader, pick_hi) in [
+        ("const32_all", &const32_all, true),
+        ("const32_none", &const32_none, false),
+        ("const64_all", &const64_all, true),
+        ("const64_none", &const64_none, false),
+    ] {
+        run_cases(shader, &inputs, |backend, _, inp, got| {
+            let want = if pick_hi { inp[3] } else { inp[2] };
+            assert_eq!(got, want, "{backend}: {name}({inp:?})");
+        });
+    }
 }

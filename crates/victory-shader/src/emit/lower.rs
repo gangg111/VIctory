@@ -5328,8 +5328,10 @@ impl<'a> Lower<'a> {
                     Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                     _ => None,
                 };
+                let dst = inst.writes.first().map(|w| w.1);
                 let m = mask
                     .and_then(|m| self.x.st.masks.get(&m).copied())
+                    .or_else(|| dst.and_then(|d| self.x.st.uniform_selects.get(&d).copied()))
                     .ok_or("a select on an untracked mask")?;
                 let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
@@ -8344,9 +8346,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -8363,9 +8363,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -8383,13 +8386,12 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             options: super::TranslateOptions::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
@@ -8663,5 +8665,132 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn selects_on_masks_the_same_in_every_lane_need_no_lane_index() {
+        let store_lds = [
+            0xD834_0000u32,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let wave32_masks: [&[u32]; 5] = [
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0x8502_80C1, // s_cselect_b32 s2, -1, 0
+                0xD501_0001,
+                0x0009_0903, // v_cndmask_b32 v1, v3, v4, s2
+            ],
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0x8502_C180, // s_cselect_b32 s2, 0, -1
+                0xD501_0001,
+                0x0009_0903, // v_cndmask_b32 v1, v3, v4, s2
+            ],
+            &[
+                0xBE82_03C1, // s_mov_b32 s2, -1
+                0xD501_0001,
+                0x0009_0903, // v_cndmask_b32 v1, v3, v4, s2
+            ],
+            &[
+                0xBE82_0380, // s_mov_b32 s2, 0
+                0xD501_0001,
+                0x0009_0903, // v_cndmask_b32 v1, v3, v4, s2
+            ],
+            // Subsequent scalar ALU use (`s_xor_b32`) on the uniform select mask
+            // must not trigger `reads_mask_as_data` or `LANE_MASK`.
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0x8502_80C1, // s_cselect_b32 s2, -1, 0
+                0xD501_0001,
+                0x0009_0903, // v_cndmask_b32 v1, v3, v4, s2
+                0x8903_8102, // s_xor_b32 s3, s2, 1
+                0x4A02_0203, // v_add_nc_u32 v1, s3, v1
+            ],
+        ];
+        let layout = || {
+            vec![
+                root(RootType::Constants, 0, 0),
+                root(RootType::Constants, 1, 1),
+            ]
+        };
+        for head in wave32_masks {
+            let words: Vec<u32> = head.iter().chain(&store_lds).copied().collect();
+            let l = lower_wave(&words, layout(), vec![], false).unwrap();
+            assert!(!l.wave_ops);
+        }
+
+        let wave64_masks: [&[u32]; 4] = [
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0x8582_80C1, // s_cselect_b64 s[2:3], -1, 0
+                0xD501_0001,
+                0x0009_0903, // v_cndmask_b32 v1, v3, v4, s[2:3]
+            ],
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0x8582_C180, // s_cselect_b64 s[2:3], 0, -1
+                0xD501_0001,
+                0x0009_0903, // v_cndmask_b32 v1, v3, v4, s[2:3]
+            ],
+            &[
+                0xBE82_04C1, // s_mov_b64 s[2:3], -1
+                0xD501_0001,
+                0x0009_0903, // v_cndmask_b32 v1, v3, v4, s[2:3]
+            ],
+            &[
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0xD501_0001,
+                0x0009_0903, // v_cndmask_b32 v1, v3, v4, s[2:3]
+            ],
+        ];
+        for head in wave64_masks {
+            let words: Vec<u32> = head.iter().chain(&store_lds).copied().collect();
+            let l = lower_wave(&words, layout(), vec![], true).unwrap();
+            assert!(!l.wave_ops);
+        }
+
+        // Arbitrary lane-dependent or non-uniform masks remain refused.
+        for (bad_head, wave64) in [
+            (
+                &[
+                    0x8F02_0081u32, // s_lshl_b32 s2, 1, s0
+                    0xD501_0001,
+                    0x0009_0903, // v_cndmask_b32 v1, v3, v4, s2
+                ][..],
+                false,
+            ),
+            (
+                &[
+                    0xBE82_0385u32, // s_mov_b32 s2, 5
+                    0xD501_0001,
+                    0x0009_0903, // v_cndmask_b32 v1, v3, v4, s2
+                ][..],
+                false,
+            ),
+            (
+                &[
+                    0xBF06_0100u32, // s_cmp_eq_u32 s0, s1
+                    0x8582_80C1,    // s_cselect_b64 s[2:3], -1, 0
+                    0xBE83_0380,    // s_mov_b32 s3, 0
+                    0xD501_0001,
+                    0x0009_0903, // v_cndmask_b32 v1, v3, v4, s[2:3]
+                ][..],
+                true,
+            ),
+        ] {
+            let words: Vec<u32> = bad_head.iter().chain(&store_lds).copied().collect();
+            let err = lower_wave(&words, layout(), vec![], wave64).err().unwrap();
+            assert!(
+                matches!(
+                    err,
+                    crate::ShaderError::Unsupported {
+                        what: "a select on an untracked mask",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        }
     }
 }
