@@ -85,6 +85,17 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
+/// LOKALNA DIAGNOSTYKA (gpu-189): adresy slow ogladanych przez VICTORY_PEEK.
+#[cfg(feature = "diagnostics")]
+pub(crate) static PEEKED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Whether refreshes also cover ranges the submission's shaders will write
+/// (`VICTORY_SHADOW_REFRESH_BUSY=1`, experiment).
+fn refresh_busy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADOW_REFRESH_BUSY").is_some_and(|v| v == "1"))
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -95,6 +106,41 @@ impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
+    }
+
+    /// LOKALNA DIAGNOSTYKA (gpu-189): slowo kopii na hoscie pod adresem tytulu (stan z ostatniego
+    /// odswiezenia albo zapisow GPU), jesli kopia ma trwale mapowanie.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn peek(&self, address: u64) -> Option<u32> {
+        if self.data.is_null() || address < self.start || address + 4 > self.start + self.len {
+            return None;
+        }
+        // SAFETY: inside the persistent mapping of the copy.
+        Some(unsafe { (self.data.add((address - self.start) as usize) as *const u32).read_unaligned() })
+    }
+
+    /// LOKALNA DIAGNOSTYKA (gpu-189): stan kopii dla strony z `address`.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn debug_page(&self, address: u64) -> String {
+        let page = address as usize / PAGE;
+        let base = self.start as usize / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner()).get(page - base).copied();
+        let busy: Vec<String> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e)| a <= address as usize && (address as usize) < e)
+            .map(|&(a, e)| format!("{a:#x}+{:#x}", e - a))
+            .collect();
+        let written = crate::watch::writes(page * PAGE, (page + 1) * PAGE, false)
+            .map(|(now, w)| format!("now={now} w={w:?}"));
+        format!(
+            "copy {:#x}+{:#x} watched={} copied={copied:?} busy={busy:?} watch={written:?}",
+            self.start,
+            self.len,
+            self.watched.load(Ordering::Relaxed)
+        )
     }
 
     /// Bytes from a title address to the buffer's end.
@@ -205,6 +251,20 @@ impl Shadow {
             && to <= taken + before.len()
             && from < to
         {
+            // LOKALNA DIAGNOSTYKA (gpu-189): czy GPU tej wysylki zapisalo slowa ogladane przez VICTORY_PEEK.
+            #[cfg(feature = "diagnostics")]
+            for &a in PEEKED.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                let a = a as usize;
+                if a >= start + from && a + 4 <= start + to {
+                    let o = a - start;
+                    let was = u32::from_le_bytes(before[o - taken..o - taken + 4].try_into().unwrap());
+                    // SAFETY: inside the mapping.
+                    let now = unsafe { (self.data.add(o) as *const u32).read_unaligned() };
+                    if was != now {
+                        tracing::warn!(at = format!("{a:#x}"), was = format!("{was:#x}"), now = format!("{now:#x}"), "PEEK: GPU wrote a peeked word");
+                    }
+                }
+            }
             let before = &before[from - taken..to - taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
@@ -284,6 +344,43 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        #[cfg(feature = "diagnostics")]
+        if let Ok(v) = std::env::var("VICTORY_PEEK_ADDR")
+            && let Ok(a) = usize::from_str_radix(v.trim().trim_start_matches("0x"), 16)
+            && from <= a
+            && a < to
+        {
+            // LOKALNA DIAGNOSTYKA (gpu-189): czy odswiezenie tego adresu omija zakres zapisow GPU
+            let hit: Vec<String> = busy
+                .iter()
+                .filter(|&&(s, e)| s <= a && a < e)
+                .map(|&(s, e)| format!("{s:#x}+{:#x}", e - s))
+                .collect();
+            tracing::warn!(at = format!("{a:#x}"), range = format!("{from:#x}..{to:#x}"), skipped_by = ?hit, "PEEK refresh");
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            static SEEN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            for &(s, e) in &busy {
+                if e - s >= 16 << 20 && seen.len() < 64 && !seen.contains(&(s, e)) {
+                    seen.push((s, e));
+                    tracing::warn!(
+                        busy = format!("{s:#x}+{:#x}", e - s),
+                        refresh = format!("{from:#x}..{to:#x}"),
+                        "PEEK: big GPU-write range skips a refresh"
+                    );
+                }
+            }
+        }
+        // EKSPERYMENT (gpu-189): VICTORY_SHADOW_REFRESH_BUSY=1 odswieza takze zakresy, do ktorych
+        // shadery tej wysylki dopiero beda pisac, i poprawia migawke "before" o swieze bajty, zeby
+        // copy_back nie wzial ich za zapisy GPU. GPU tej wysylki jeszcze nie ruszylo.
+        if !busy.is_empty() && refresh_busy() {
+            let bytes = self.update_free(from, to);
+            self.resnap(from - start, to - start);
+            return bytes;
+        }
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -304,9 +401,42 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// LOKALNA DIAGNOSTYKA (gpu-189): kopiuje `[address, address + len)` z pamieci tytulu od razu.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn copy_now(&self, address: u64, len: u64) {
+        let from = address as usize;
+        self.copy(from, from + len as usize);
+        let start = self.start as usize;
+        self.resnap(from.max(start) - start, (from + len as usize).min(start + self.len as usize) - start);
+    }
+
+    /// Copies the copy's current bytes `[from, to)` (offsets in the copy) into the
+    /// snapshot of a pending submission, where they overlap it.
+    fn resnap(&self, from: usize, to: usize) {
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, bytes)) = before.as_mut() {
+            let (a, b) = (from.max(*at), to.min(*at + bytes.len()));
+            if a < b {
+                // SAFETY: inside the mapping.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+                bytes[a - *at..b - *at].copy_from_slice(host);
+            }
+        }
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // LOKALNA DIAGNOSTYKA (gpu-189): VICTORY_SHADOW_NO_WATCH=1 kopiuje zakres w calosci przy kazdej
+        // wysylce, bez sledzenia zapisow (sprawdza, czy stale kopie biora sie z niewidzianych zapisow).
+        #[cfg(feature = "diagnostics")]
+        {
+            static NO_WATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *NO_WATCH.get_or_init(|| std::env::var_os("VICTORY_SHADOW_NO_WATCH").is_some()) {
+                self.copy(from, to);
+                return to - from;
+            }
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);

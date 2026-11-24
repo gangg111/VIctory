@@ -477,6 +477,23 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
+/// The raw window (first dword, dword count) of a structured buffer view of
+/// `count` elements of `stride` bytes from element `first`, at `offset` bytes
+/// into its host copy; `None` for a view that is not structured, a stride not
+/// a multiple of 4, or a start not 16-byte aligned (raw views need it).
+fn raw_window(first: u64, count: u32, stride: u32, offset: u64) -> Option<(u64, u32)> {
+    let stride = u64::from(stride);
+    if stride == 0 || stride % 4 != 0 {
+        return None;
+    }
+    let start = first * stride + offset;
+    if start % 16 != 0 {
+        return None;
+    }
+    let dwords = u32::try_from(u64::from(count) * stride / 4).ok()?;
+    Some((start / 4, dwords))
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -484,6 +501,26 @@ fn buffer_srv(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
+    // EKSPERYMENT (gpu-189): VICTORY_RAW_SRV=1 robi z widoku structured widok surowy. NVIDIA ogranicza
+    // odczyt surowy (ByteAddressBuffer, wiekszosc odczytow tlumacza) z widoku structured do
+    // NumElements * 4 bajtow (tests/d3d12_uint_view_as_float, tryb structured). Shadery czytajace
+    // te same widoki uchwytem structured zwalniaja wtedy, wiec to nie jest jeszcze poprawka.
+    let raw_srv = std::env::var_os("VICTORY_RAW_SRV").is_some_and(|v| v == "1");
+    if raw_srv {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { &mut desc.Anonymous.Buffer };
+        if let Some((first, count)) = raw_window(b.FirstElement, b.NumElements, b.StructureByteStride, shadow.offset(address)) {
+            b.FirstElement = first;
+            b.NumElements = count;
+            b.StructureByteStride = 0;
+            b.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+            let host = host()?;
+            // SAFETY: a live buffer and a slot of our heap.
+            unsafe { host.device.CreateShaderResourceView(&shadow.buffer, Some(&desc), at) };
+            return Some(Some(shadow.buffer.clone()));
+        }
+    }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };

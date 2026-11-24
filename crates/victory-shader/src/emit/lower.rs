@@ -1810,6 +1810,17 @@ impl<'a> Lower<'a> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
+        // LOKALNA DIAGNOSTYKA (gpu-189): VICTORY_SHADER_LOOP_LOG=1 wypisuje numery petli
+        // (jak w VICTORY_SHADER_LOOP_MASK) i adresy ich naglowkow w kodzie konsoli.
+        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_SHADER_LOOP_LOG").is_some() {
+            let mut heads: Vec<usize> = self.counters.keys().copied().collect();
+            heads.sort_unstable();
+            let list: Vec<String> =
+                heads.iter().enumerate().map(|(i, &b)| format!("{i}@{:#x}", p.blocks[b].offset)).collect();
+            if !list.is_empty() {
+                eprintln!("loop headers: {}", list.join(" "));
+            }
+        }
         self.cur = self.s.entry;
         self.inputs()?;
         if self.emulating_wave64() {
@@ -7552,7 +7563,9 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        // LOKALNA DIAGNOSTYKA (gpu-189): numer petli = pozycja naglowka wsrod naglowkow programu.
+        let ordinal = self.counters.keys().filter(|&&k| k < to).count();
+        let limit = self.s.m.i32(super::loop_limit_for(ordinal));
         self.counters
             .get_mut(&to)
             .expect("header")

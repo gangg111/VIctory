@@ -85,6 +85,9 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                if let Some(mask) = victory_shader::emit::loop_mask() {
+                    bytes.extend_from_slice(&mask.to_le_bytes());
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

@@ -122,6 +122,31 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// LOKALNA DIAGNOSTYKA (gpu-189): `VICTORY_SHADER_LOOP_MASK` (maska bitowa, dziesietnie albo `0x`)
+/// zaweza [`loop_limit`] do petli o tych numerach (kolejnosc naglowkow w programie, od 0);
+/// pozostale dostaja [`DEFAULT_LOOP_LIMIT`]. Bez maski: wszystkie petle.
+pub fn loop_mask() -> Option<u64> {
+    static MASK: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHADER_LOOP_MASK").ok()?;
+        let v = v.trim();
+        match v.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        }
+    })
+}
+
+/// [`loop_limit`] dla petli numer `ordinal` z uwzglednieniem [`loop_mask`].
+pub fn loop_limit_for(ordinal: usize) -> u32 {
+    match loop_mask() {
+        Some(m) if cfg!(feature = "diagnostics") && (ordinal >= 64 || m >> ordinal & 1 == 0) => {
+            DEFAULT_LOOP_LIMIT
+        }
+        _ => loop_limit(),
+    }
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {

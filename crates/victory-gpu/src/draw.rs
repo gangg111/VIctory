@@ -1144,6 +1144,11 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
+        // LOKALNA DIAGNOSTYKA (gpu-189): VICTORY_SHADOW_SMALL_NOW=1 kopiuje male widoki od razu.
+        #[cfg(feature = "diagnostics")]
+        if len <= 4096 && u.kind != ResourceType::Uav && std::env::var_os("VICTORY_SHADOW_SMALL_NOW").is_some() {
+            shadow.copy_now(address, len);
+        }
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
         }
@@ -1200,15 +1205,41 @@ fn describe(view: Option<&View>) -> String {
                 format!("buffer {:?} f{f}", crate::descriptor::host::buffer_range(v))
             }),
         Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
-        Some(View::Placed(u, r, d)) => format!(
-            "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
-            r[0],
-            u64::from(r[4]) | u64::from(r[5]) << 32,
-            r[6],
-            r[8],
-            r[11],
-            u64::from(d[10]) | u64::from(d[11]) << 32
-        ),
+        Some(View::Placed(u, r, d)) => {
+            let base = u64::from(d[10]) | u64::from(d[11]) << 32;
+            let width = u64::from(r[4]) | u64::from(r[5]) << 32;
+            let mut s = format!(
+                "placed uav={u} dim {} {}x{} f{} layout {:#x} at {base:#x}",
+                r[0], width, r[6], r[8], r[11],
+            );
+            // LOKALNA DIAGNOSTYKA (gpu-189): VICTORY_PEEK=0x72c,... dopisuje slowa bufora pod tymi
+            // przesunieciami: w pamieci tytulu i w kopii na hoscie (to drugie czyta shader).
+            if r[0] == 1 && let Ok(list) = std::env::var("VICTORY_PEEK") {
+                for off in list.split(',').filter_map(|o| u64::from_str_radix(o.trim().trim_start_matches("0x"), 16).ok()) {
+                    if off + 4 > width {
+                        continue;
+                    }
+                    let at = base + off;
+                    let title = crate::texture::committed(at as *const u8, 4)
+                        // SAFETY: 4 committed bytes of title memory.
+                        .then(|| unsafe { (at as *const u32).read_unaligned() });
+                    {
+                        let mut p = crate::shadow::PEEKED.lock().unwrap_or_else(|e| e.into_inner());
+                        if !p.contains(&at) && p.len() < 4096 {
+                            p.push(at);
+                        }
+                    }
+                    let sh = crate::shadow::find(at, 4);
+                    let host = sh.as_ref().and_then(|sh| sh.peek(at));
+                    let state = sh.map(|sh| sh.debug_page(at)).unwrap_or_default();
+                    if title.is_some() && host.is_some() && title != host {
+                        tracing::warn!(at = format!("{at:#x}"), width, ?title, ?host, "PEEK: stale word at record");
+                    }
+                    s.push_str(&format!(" peek+{off:#x} title={title:x?} host={host:x?} {state}"));
+                }
+            }
+            s
+        }
         // The first four values, as a colour rectangle's constants are.
         Some(View::Constant(address, size))
             if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
