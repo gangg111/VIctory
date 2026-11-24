@@ -565,6 +565,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.describe_wanted(&p.name, || self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -575,6 +577,34 @@ impl State {
     /// (with the view at that heap index, if one is), the host addresses
     /// of its root views and the views its tables name.
     #[cfg(feature = "diagnostics")]
+    /// LOKALNA DIAGNOSTYKA (gpu-189): `VICTORY_DESCRIBE=hash,hash` loguje opis komendy (sloty,
+    /// widoki) potokow z tymi shaderami, najwyzej 4 razy na potok, bez DRED i bez wolnej listy.
+    #[cfg(feature = "diagnostics")]
+    fn describe_wanted(&self, pipeline: &str, text: impl FnOnce() -> String) {
+        static WANTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let wanted = WANTED.get_or_init(|| {
+            std::env::var("VICTORY_DESCRIBE")
+                .map(|v| v.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect())
+                .unwrap_or_default()
+        });
+        if wanted.is_empty() || !wanted.iter().any(|h| pipeline.contains(h.as_str())) {
+            return;
+        }
+        static SEEN: std::sync::Mutex<Vec<(String, u32)>> = std::sync::Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let n = match seen.iter_mut().find(|(p, _)| p == pipeline) {
+            Some((_, n)) => n,
+            None => {
+                seen.push((pipeline.to_owned(), 0));
+                &mut seen.last_mut().expect("pushed").1
+            }
+        };
+        if *n < 4 {
+            *n += 1;
+            tracing::warn!(op = %text(), "DESCRIBE");
+        }
+    }
+
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -1082,6 +1112,12 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+            self.describe_wanted(&p.name, || {
+                self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            });
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
