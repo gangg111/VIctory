@@ -172,12 +172,58 @@ pub(crate) fn dispatched() -> u64 {
 /// copy in upload memory.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
+/// How far past a root SRV the title's shaders may read. A root SRV is a bare
+/// address with no bounds, and the world's mesh shaders fetch vertices
+/// through one megabytes past where it points, past the end of the title
+/// buffer it lies in: on the console that is more title memory, on the host
+/// the end of that buffer's copy, and an NVIDIA GPU faults there (Aftermath
+/// on an RTX 3080: reads 3 MB and 16 MB past copies, one inside a freed
+/// texture placed next to the copy).
+const ROOT_SRV_REACH: u64 = 32 << 20;
+
+fn root_srv_reach() -> u64 {
+    // LOKALNA DIAGNOSTYKA (gpu-189): VICTORY_ROOT_REACH_MB (0 = as before).
+    #[cfg(feature = "diagnostics")]
+    if let Some(mb) = std::env::var("VICTORY_ROOT_REACH_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        return mb << 20;
+    }
+    ROOT_SRV_REACH
+}
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
-    let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
+    let mut shadow = crate::shadow::find(address, 1)?;
+    let mut len = shadow
         .left(address)
         .min(if srv { 1 << 20 } else { 1 << 16 });
+    let reach = root_srv_reach();
+    if srv && reach > 0 && shadow.left(address) < reach {
+        // A copy holding the whole reach: a bigger title buffer around it,
+        // else title memory copied as is.
+        if let Some(wide) = crate::shadow::find_wide(address, reach) {
+            shadow = wide;
+            len = reach;
+        }
+    }
     let gpu = shadow.gpu(address);
+    // LOKALNA DIAGNOSTYKA (gpu-189): VICTORY_ROOT_LOG=1 loguje kazdy nowy zakres GPU root SRV
+    // (od adresu do konca kopii), zeby porownac go z adresem bledu strony z Aftermath.
+    #[cfg(feature = "diagnostics")]
+    if srv && std::env::var_os("VICTORY_ROOT_LOG").is_some() {
+        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u64, u64)>>> =
+            std::sync::Mutex::new(None);
+        let end = gpu + shadow.left(address);
+        let mut seen = SEEN.lock().unwrap();
+        let seen = seen.get_or_insert_with(Default::default);
+        if seen.len() < 20000 && seen.insert((gpu, end)) {
+            tracing::info!(
+                address = format_args!("{address:#x}"),
+                gpu = format_args!("{gpu:#x}"),
+                end = format_args!("{end:#x}"),
+                left = shadow.left(address),
+                "root srv range"
+            );
+        }
+    }
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         return Some(gpu);
@@ -531,6 +577,16 @@ impl State {
                         continue;
                     };
                     let Some(gpu) = root_view(list, *address, srv) else {
+                        // LOKALNA DIAGNOSTYKA (gpu-189): root zostaje nieustawiony.
+                        #[cfg(feature = "diagnostics")]
+                        if std::env::var_os("VICTORY_ROOT_LOG").is_some() {
+                            tracing::warn!(
+                                slot,
+                                srv,
+                                address = format_args!("{address:#x}"),
+                                "root view without a copy: parameter left unset"
+                            );
+                        }
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.

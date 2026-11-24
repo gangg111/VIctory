@@ -537,6 +537,14 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// for its bytes twice, and the GPU's writes land in one copy), else of
 /// the innermost, made now.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_or(address, len, loose)
+}
+
+fn find_or(
+    address: u64,
+    len: u64,
+    loose: impl FnOnce(u64, u64) -> Option<Arc<Shadow>>,
+) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let holding: Vec<((u64, usize), bool)> = map
@@ -594,7 +602,23 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    loose_window(address, end, start, end.next_multiple_of(WINDOW) - start)
+}
+
+/// Like [`find`], for a range a root SRV may read: a title buffer holding
+/// it, else title memory in windows of twice the range's size rounded up to
+/// a power of two, on a grid of that size. Any range fits one, and each
+/// title byte is in at most two, where windows cut at 4 MiB would make a
+/// copy per root SRV.
+pub(crate) fn find_wide(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_or(address, len, |address, end| {
+        let grain = (end - address).next_power_of_two().max(WINDOW);
+        let start = address & !(grain - 1);
+        loose_window(address, end, start, 2 * grain)
+    })
+}
+
+fn loose_window(address: u64, end: u64, start: u64, len: u64) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     // Any window copied already that holds the range: a range crossing a
     // window's end used to get a second copy of the same bytes.
@@ -611,11 +635,19 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
+    if len >= 32 << 20 {
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            len,
+            "wide loose memory copied to the host"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory copied to the host"
+        );
+    }
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
     map.insert((start, len), shadow.clone());
     Some(shadow)
