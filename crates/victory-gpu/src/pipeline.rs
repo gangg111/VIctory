@@ -109,13 +109,27 @@ impl Shader {
             .get_or_init(|| {
                 let done = translate(&self.container);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            "shader translated"
+                        );
+                        // LOKALNA DIAGNOSTYKA (gpu-189): VICTORY_DXIL_DUMP=<katalog> zapisuje DXIL kazdego
+                        // przetlumaczonego shadera jako <hash>.<etap>.dxil; VICTORY_DXIL_DUMP_HASHES=a,b zaweza.
+                        if let Some(dir) = std::env::var_os("VICTORY_DXIL_DUMP") {
+                            let hash = self.hash.to_string();
+                            let wanted = std::env::var("VICTORY_DXIL_DUMP_HASHES")
+                                .map(|l| l.split(',').any(|h| h.trim() == hash))
+                                .unwrap_or(true);
+                            if wanted {
+                                let path = std::path::Path::new(&dir).join(format!("{hash}.{}.dxil", self.stage));
+                                let _ = std::fs::write(path, &t.host.dxil);
+                            }
+                        }
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
