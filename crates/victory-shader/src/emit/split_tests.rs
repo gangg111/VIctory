@@ -292,21 +292,96 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// Groups of several console waves: each reads lane 40 of its own console
+/// wave (v0 is the thread id, so 64w + 40).
 #[test]
-fn console_flow_is_for_one_console_wave_per_group() {
+fn console_flow_runs_groups_of_several_console_waves() {
     let body = [
         0xD760_0009,
         0x0001_5100, // v_readlane_b32 s9, v0, 40
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
-    let nvidia = super::Target {
-        lanes_min: 32,
-        lanes_max: 32,
-    };
-    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    for threads in [128, 256] {
+        console_flow_case("v_readlane 40, several waves", &body, threads, |t| {
+            t / 64 * 64 + 40
+        });
+    }
+}
+
+/// Console waves of one group taking different branches: only wave 0 has
+/// lanes below 20, so only it reaches the exchanges inside the branch; the
+/// others meet them with other barriers, and nobody hangs.
+#[test]
+fn console_waves_of_a_group_branch_differently() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    console_flow_case("if (t < 20) v2 = readlane(10), 256 threads", &body, 256, |t| {
+        if t < 20 { 10 } else { 1 }
+    });
+}
+
+/// Loops of different lengths per console wave (lane t runs t times):
+/// wave 1 loops twice as long as wave 0, reading lane 40 each time.
+#[test]
+fn console_waves_of_a_group_loop_differently() {
+    let body = [
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0006, // s_cbranch_execz end
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF89_FFFA, // s_cbranch_execnz loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    console_flow_case("loop t times reading lane 40, 128 threads", &body, 128, |t| {
+        t + t / 64 * 64 + 40
+    });
+}
+
+/// The program's `s_barrier` orders LDS between console waves that took
+/// different branches before it: lane t writes t to dword t, and after the
+/// barrier reads dword t ^ 64 (the other console wave's).
+#[test]
+fn program_barriers_order_lds_between_console_waves() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xD834_0000,
+        0x0000_0004, // ds_write_b32 v4, v0
+        0xBF8A_0000, // s_barrier
+        0x3A0A_00C0, // v_xor_b32 v5, 64, v0
+        0x340A_0A82, // v_lshlrev_b32 v5, 2, v5
+        0xD8D8_0000,
+        0x0600_0005, // ds_read_b32 v6, v5
+        0x7E04_0306, // v_mov_b32 v2, v6
+    ];
+    program_case(
+        "s_barrier between console waves, 128 threads",
+        &program_lds(&body, 128),
+        |t| t ^ 64,
+        true,
+    );
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in

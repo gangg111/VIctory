@@ -267,6 +267,12 @@ struct Lower<'a> {
     console_flat: Option<V>,
     /// Group-shared slots the two halves exchange a dword through.
     xchg: Option<V>,
+    /// Console flow with several console waves in the group (see
+    /// [`Self::soft_barrier`]).
+    multi: bool,
+    /// Its group-shared state: per-thread barrier counts, per-half
+    /// arrivals at the program's barriers, per-half finish stamps.
+    multi_sync: Option<(V, V, V)>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -676,7 +682,13 @@ impl<'a> Lower<'a> {
                 && !x.per_lane_only
                 && needs_first_lane_exchange(x);
             if (needs_wave64 || prefers_console) && !x.target.runs(64) {
-                let excluded = if threads > 64 {
+                // Several console waves in a group run the console flow with
+                // counted barriers (see [`Lower::soft_barrier`]): whole
+                // console waves, at most 32 halves, and room for the state (#1433).
+                let multi_ok = threads.is_multiple_of(64)
+                    && threads <= 1024
+                    && s.lds_dwords + threads + 3 * (threads / 32) <= 8192;
+                let excluded = if threads > 64 && !multi_ok {
                     Some(
                         "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
                     )
@@ -684,7 +696,7 @@ impl<'a> Lower<'a> {
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
-                } else if s.threads.map(|t| t.iter().product::<u32>()) != Some(64)
+                } else if !threads.is_multiple_of(64)
                     && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                 {
                     Some("a whole-wave section of a wave64 on a host without 64-lane waves")
@@ -780,6 +792,9 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let multi = x.console_cf
+            && split
+            && s.threads.is_some_and(|t| t.iter().product::<u32>() > 64);
         Lower {
             s,
             x,
@@ -823,6 +838,8 @@ impl<'a> Lower<'a> {
             no_console_flow,
             console_flat: None,
             xchg: None,
+            multi,
+            multi_sync: None,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -2776,9 +2793,13 @@ impl<'a> Lower<'a> {
             // next one. The halves are two host waves, both here (console
             // flow): a group barrier before each LDS access puts it after
             // every earlier one, whichever half made it.
-            let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
-            self.s
-                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            if self.multi {
+                self.hw_barrier(self.cur);
+            } else {
+                let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+                self.s
+                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            }
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
@@ -2929,6 +2950,10 @@ impl<'a> Lower<'a> {
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
+            Fields::Sopp { .. } if name == "s_barrier" && self.multi => {
+                self.soft_barrier();
+                Ok(())
+            }
             Fields::Sopp { .. } if name == "s_barrier" => {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
@@ -7597,6 +7622,9 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
+                if self.multi {
+                    self.drain();
+                }
                 Term::Ret
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
@@ -7808,6 +7836,34 @@ impl<'a> Lower<'a> {
         if threads <= 32 {
             return (x, z);
         }
+        if self.multi {
+            // Each half its own slot; the halves of a console wave reach
+            // their exchanges at the same group barrier count.
+            let f = self.console_flat();
+            let k5 = self.s.m.i32(5);
+            let h = self.s.m.bin(at, Bin::LShr, f, k5);
+            let slots = match self.xchg {
+                Some(g) => g,
+                None => {
+                    let arr = self.s.m.array(threads / 32, self.s.t.i32);
+                    let g = self.s.m.global("xchg", arr, 3);
+                    self.xchg = Some(g);
+                    g
+                }
+            };
+            let mine = self.s.m.element(at, slots, h);
+            self.s.m.store(at, mine, x);
+            self.hw_barrier(at);
+            let (one, not1) = (self.s.m.i32(1), self.s.m.i32(!1));
+            let (l, u) = (
+                self.s.m.bin(at, Bin::And, h, not1),
+                self.s.m.bin(at, Bin::Or, h, one),
+            );
+            let (pl, pu) = (self.s.m.element(at, slots, l), self.s.m.element(at, slots, u));
+            let (lo, hi) = (self.s.m.load(at, pl), self.s.m.load(at, pu));
+            self.hw_barrier(at);
+            return (lo, hi);
+        }
         let (_, half) = self.console_lane();
         let slots = match self.xchg {
             Some(g) => g,
@@ -7834,6 +7890,157 @@ impl<'a> Lower<'a> {
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         (lo, hi)
+    }
+
+    /// Multi-wave console flow: the group-shared state (`phase`: group
+    /// barriers each thread has passed; `arrived`: per half, the count of
+    /// the program's barriers it reached (mod 4, top 2 bits) and the phase
+    /// stamp it reached the last one at; `finished`: per half, the phase
+    /// stamp it ended at, 0 while running). Made and cleared at the entry.
+    ///
+    /// Why: the console waves of a group branch differently, so they reach
+    /// different group barriers (their exchanges); barriers pair up by
+    /// count, not place. What must agree is decided from stamps: a stamp
+    /// `s` written before barrier `s` counts once a thread has passed `s`,
+    /// so every thread deciding after the same barrier sees the same thing.
+    fn multi_state(&mut self) -> (V, V, V) {
+        if let Some(s) = self.multi_sync {
+            return s;
+        }
+        let threads: u32 = self.s.threads.expect("compute").iter().product();
+        let i32t = self.s.t.i32;
+        let (per_thread, per_half) = (
+            self.s.m.array(threads, i32t),
+            self.s.m.array(threads / 32, i32t),
+        );
+        let ph = self.s.m.global("phase", per_thread, 3);
+        let arr = self.s.m.global("arrived", per_half, 3);
+        let fin = self.s.m.global("finished", per_half, 3);
+        self.multi_sync = Some((ph, arr, fin));
+        let e = self.s.entry;
+        let f = self.console_flat();
+        let (k5, z) = (self.s.m.i32(5), self.s.m.i32(0));
+        let h = self.s.m.bin(e, Bin::LShr, f, k5);
+        for (g, i) in [(ph, f), (arr, h), (fin, h)] {
+            let p = self.s.m.element(e, g, i);
+            self.s.m.store(e, p, z);
+        }
+        self.hw_barrier(e);
+        (ph, arr, fin)
+    }
+
+    /// A group barrier (LDS fence, UAV fence when the program writes UAVs)
+    /// counted in this thread's phase; the new phase.
+    fn hw_barrier(&mut self, at: usize) -> V {
+        let (ph, _, _) = self.multi_state();
+        let void = self.s.t.void;
+        let mode = self.s.m.i32(1 | 8 | if self.writes_uavs { 2 } else { 0 });
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let f = self.console_flat();
+        let p = self.s.m.element(at, ph, f);
+        let one = self.s.m.i32(1);
+        let old = self.s.m.load(at, p);
+        let new = self.s.m.bin(at, Bin::Add, old, one);
+        self.s.m.store(at, p, new);
+        new
+    }
+
+    /// This thread's phase and half.
+    fn phase_and_half(&mut self, at: usize) -> (V, V) {
+        let (ph, _, _) = self.multi_state();
+        let f = self.console_flat();
+        let p = self.s.m.element(at, ph, f);
+        let q = self.s.m.load(at, p);
+        let k5 = self.s.m.i32(5);
+        (q, self.s.m.bin(at, Bin::LShr, f, k5))
+    }
+
+    /// Loops from `self.cur` over group barriers until `ok(phase, half)`
+    /// holds for every half of the group (host lane `i` tests half `i`);
+    /// `self.cur` is then the block after.
+    fn wait_for_halves(&mut self, ok: impl Fn(&mut Self, usize, V, V) -> V) {
+        let threads: u32 = self.s.threads.expect("compute").iter().product();
+        let (wait, after) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(self.cur, Term::Br(wait));
+        let q = self.hw_barrier(wait);
+        let i32t = self.s.t.i32;
+        let lane = self.s.op(wait, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let (n, z) = (self.s.m.i32(threads / 32), self.s.m.i32(0));
+        let inside = self.s.m.cmp(wait, pred::IULT, lane, n);
+        let i = self.s.m.select(wait, inside, lane, z);
+        let good = ok(self, wait, q, i);
+        let outside = self.s.m.cmp(wait, pred::IUGE, lane, n);
+        let fine = self.s.m.bin(wait, Bin::Or, outside, good);
+        let i1 = self.s.t.i1;
+        let all = self.s.op(wait, "waveAllTrue", Attr::NoUnwind, i1, 114, &[fine]);
+        self.s.flags |= flags::WAVE_OPS;
+        self.s.m.terminate(wait, Term::CondBr(all, after, wait));
+        self.cur = after;
+    }
+
+    /// Whether half `i` has ended by phase `q`.
+    fn ended(&mut self, at: usize, q: V, i: V) -> V {
+        let (_, _, fin) = self.multi_state();
+        let p = self.s.m.element(at, fin, i);
+        let s = self.s.m.load(at, p);
+        let z = self.s.m.i32(0);
+        let set = self.s.m.cmp(at, pred::NE, s, z);
+        let before = self.s.m.cmp(at, pred::IULE, s, q);
+        self.s.m.bin(at, Bin::And, set, before)
+    }
+
+    /// The program's `s_barrier` with several console waves in the group:
+    /// this half arrives (count + 1, stamped), then waits until every half
+    /// has arrived at this count (or the next) or ended.
+    fn soft_barrier(&mut self) {
+        let (_, arr, _) = self.multi_state();
+        let c = self.cur;
+        let (q, h) = self.phase_and_half(c);
+        let p = self.s.m.element(c, arr, h);
+        let e = self.s.m.load(c, p);
+        let (k30, one, three, mask) = (
+            self.s.m.i32(30),
+            self.s.m.i32(1),
+            self.s.m.i32(3),
+            self.s.m.i32(0x3fff_ffff),
+        );
+        let count = self.s.m.bin(c, Bin::LShr, e, k30);
+        let count = self.s.m.bin(c, Bin::Add, count, one);
+        let count = self.s.m.bin(c, Bin::And, count, three);
+        let stamp = self.s.m.bin(c, Bin::Add, q, one);
+        let top = self.s.m.bin(c, Bin::Shl, count, k30);
+        let v = self.s.m.bin(c, Bin::Or, top, stamp);
+        self.s.m.store(c, p, v);
+        let next = self.s.m.bin(c, Bin::Add, count, one);
+        let next = self.s.m.bin(c, Bin::And, next, three);
+        self.wait_for_halves(move |l, at, q, i| {
+            let p = l.s.m.element(at, arr, i);
+            let e = l.s.m.load(at, p);
+            let ci = l.s.m.bin(at, Bin::LShr, e, k30);
+            let si = l.s.m.bin(at, Bin::And, e, mask);
+            let same = l.s.m.cmp(at, pred::EQ, ci, count);
+            let seen = l.s.m.cmp(at, pred::IULE, si, q);
+            let here = l.s.m.bin(at, Bin::And, same, seen);
+            let past = l.s.m.cmp(at, pred::EQ, ci, next);
+            let ended = l.ended(at, q, i);
+            let a = l.s.m.bin(at, Bin::Or, here, past);
+            l.s.m.bin(at, Bin::Or, a, ended)
+        });
+    }
+
+    /// The end of a thread with several console waves in the group: this
+    /// half is stamped ended and keeps passing group barriers until every
+    /// half has ended (the others' exchanges and barriers need it there).
+    fn drain(&mut self) {
+        let (_, _, fin) = self.multi_state();
+        let c = self.cur;
+        let (q, h) = self.phase_and_half(c);
+        let one = self.s.m.i32(1);
+        let stamp = self.s.m.bin(c, Bin::Add, q, one);
+        let p = self.s.m.element(c, fin, h);
+        self.s.m.store(c, p, stamp);
+        self.wait_for_halves(|l, at, q, i| l.ended(at, q, i));
     }
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
@@ -7875,8 +8082,15 @@ impl<'a> Lower<'a> {
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
         self.abort = Some(a);
+        let end = if self.multi {
+            let back = std::mem::replace(&mut self.cur, a);
+            self.drain();
+            std::mem::replace(&mut self.cur, back)
+        } else {
+            a
+        };
+        self.s.m.terminate(end, Term::Ret);
         a
     }
 
@@ -9262,16 +9476,6 @@ mod select_tests {
             };
             for target in [wave32_only, super::super::Target::ANY] {
                 let result = emit(&c, &native, &p, &st, &io, &res, target);
-                if uses_select && threads > 64 && !target.runs(64) {
-                    assert!(matches!(
-                        result,
-                        Err(crate::ShaderError::Unsupported {
-                            what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
-                            ..
-                        })
-                    ));
-                    continue;
-                }
                 let shader = result.unwrap();
                 let emitted = Container::parse(&shader.dxil).unwrap();
                 let features = emitted.part(FourCC::SFI0).unwrap();

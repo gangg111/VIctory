@@ -940,11 +940,13 @@ mod tests {
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
         assert!(emit_for(&wave64, NVIDIA).is_ok());
-        // Two per group: the halves cannot meet at a group barrier yet.
+        // Two per group: on NVIDIA too, with counted barriers.
         let two = compute_of(&words, true, 128);
         assert!(emit_for(&two, RDNA).is_ok());
+        assert!(emit_for(&two, NVIDIA).is_ok());
+        // Not a whole number of console waves: refused there.
         assert_eq!(
-            emit_for(&two, NVIDIA),
+            emit_for(&compute_of(&words, true, 96), NVIDIA),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
                 what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
@@ -1012,14 +1014,10 @@ mod tests {
                 emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
             host.compute_pipeline(&one)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            match emit_for(&compute_of(&words, true, 128), target) {
-                Ok(cs) => {
-                    assert!(target.runs(64), "{name}");
-                    host.compute_pipeline(&cs)
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
-                }
-                Err(_) => assert!(!target.runs(64), "{name}"),
-            }
+            let two = emit_for(&compute_of(&words, true, 128), target)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            host.compute_pipeline(&two)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 
