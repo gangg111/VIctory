@@ -732,6 +732,8 @@ impl State {
                 }
                 Err(_) => false,
             };
+        #[cfg(feature = "diagnostics")]
+        self.note_listed(format_args!("mesh {x}"), if ran { "ran" } else { "dropped" });
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1000,6 +1002,8 @@ impl State {
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.note_listed(format_args!("draw {vertices}"), if ran { "ran" } else { "dropped" });
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1087,11 +1091,35 @@ impl State {
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.note_listed(format_args!("indexed {indices}"), if ran { "ran" } else { "dropped" });
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// LOKALNA DIAGNOSTYKA (gpu-189): w klatkach z VICTORY_CAPTURE_FRAMES kazde rysowanie: pipeline,
+    /// cele renderu (wskazniki zasobow tytulu jak w nazwach zrzutow celow) i wynik.
+    #[cfg(feature = "diagnostics")]
+    fn note_listed(&self, what: std::fmt::Arguments, outcome: &str) {
+        if !crate::capture::listed(crate::queue::presented() + 1) {
+            return;
+        }
+        let name = crate::pipeline::host_pipeline(self.pipeline as This)
+            .map_or_else(|| "no host pipeline".to_string(), |p| p.name.clone());
+        let targets: Vec<String> = self
+            .targets
+            .iter()
+            .filter(|&&t| t != 0)
+            .map(|t| format!("{t:#x}"))
+            .collect();
+        tracing::info!(
+            "listed {what}: {outcome} pipeline={:#x} {name} targets={targets:?} depth={:#x}",
+            self.pipeline,
+            self.depth
+        );
     }
 }
 
@@ -1120,19 +1148,22 @@ impl State {
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
         #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        let why = |s: &State, what: &str| {
+            s.note_listed(format_args!("indirect kind {kind} max {max}"), what);
+            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"))
+        };
         #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let why = |_: &State, _: &str| {};
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
-            why("arguments outside title buffers");
+            why(self, "arguments outside title buffers");
             return false;
         };
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
-                    why("count outside title buffers");
+                    why(self, "count outside title buffers");
                     return false;
                 }
             },
@@ -1142,7 +1173,7 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
-            why("no host signature");
+            why(self, "no host signature");
             return false;
         };
         args.refresh(list, arguments, len);
@@ -1151,7 +1182,7 @@ impl State {
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            why(self, "not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
         self.host_pipeline = 0;
@@ -1176,8 +1207,11 @@ impl State {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                None => {
+                    why(self, "no host pipeline");
+                    crate::pipeline::note_drop(self.pipeline as This)
+                }
+                Some(p) => why(self, &format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
             }
             return false;
         }
@@ -1204,6 +1238,28 @@ impl State {
             )
         };
         crate::indirect::done(list, &args.buffer);
+        #[cfg(feature = "diagnostics")]
+        {
+            // LOKALNA DIAGNOSTYKA (gpu-189): licznik z pamieci tytulu (stan po ostatniej kopii zwrotnej).
+            let value = count.map(|at| {
+                let mut v = 0u32;
+                // SAFETY: a title address the title gave as a count; a failed read leaves 0.
+                let ok = unsafe {
+                    windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                        windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                        at as *const _,
+                        (&raw mut v).cast(),
+                        4,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok != 0 { i64::from(v) } else { -1 }
+            });
+            self.note_listed(
+                format_args!("indirect kind {kind} max {max} args {arguments:#x} count {count:x?}={value:?}"),
+                "ran",
+            );
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

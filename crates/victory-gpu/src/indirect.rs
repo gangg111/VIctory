@@ -108,11 +108,20 @@ fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
+    // LOKALNA DIAGNOSTYKA (gpu-189): VICTORY_INDIRECT_BUDGET_LOG2=n zmienia budzet listy z 2^27 na 2^n.
+    #[allow(unused_mut)]
+    let mut source = SOURCE.to_string();
+    #[cfg(feature = "diagnostics")]
+    if let Some(n) = std::env::var("VICTORY_INDIRECT_BUDGET_LOG2").ok().and_then(|v| v.parse::<u32>().ok()) {
+        let n = n.min(31);
+        source = source.replace("BUDGET = 1u << 27", &format!("BUDGET = 1u << {n}"));
+        tracing::warn!(log2 = n, "indirect budget changed (experiment)");
+    }
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
