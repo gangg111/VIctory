@@ -60,9 +60,21 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
+    if (cost == 0) return;
+    // The budget only ever grows up to BUDGET: a plain add past it kept
+    // counting and wrapped 32 bits after about 64 garbage records of the
+    // largest cost, and every record after the wrap ran again.
+    uint seen = budget.Load(0);
+    bool fits = false;
+    [allow_uav_condition]
+    for (uint tries = 0; tries < 256; tries++) {
+        if (seen >= BUDGET || cost > BUDGET - seen) break;
+        uint was;
+        budget.InterlockedCompareExchange(0, seen, seen + cost, was);
+        if (was == seen) { fits = true; break; }
+        seen = was;
+    }
+    if (!fits) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
     }

@@ -113,6 +113,16 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Groups the host runs per dimension of a dispatch (and of a mesh
+/// dispatch). A count past it is undefined behaviour on the host; drivers
+/// may run it for seconds and reset the display driver.
+const MAX_GROUPS: u32 = 65_535;
+
+/// Whether the host can run a dispatch of `x * y * z` groups.
+fn dispatch_fits(x: u32, y: u32, z: u32) -> bool {
+    x <= MAX_GROUPS && y <= MAX_GROUPS && z <= MAX_GROUPS
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -513,6 +523,11 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if !dispatch_fits(x, y, z) {
+            once!(x, y, z, "a dispatch past the host's group limits dropped");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         self.bind(list, p, true);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
@@ -563,6 +578,11 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        if x > MAX_GROUPS {
+            once!(x, "a mesh dispatch past the host's group limit dropped");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -1179,4 +1199,16 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod group_limit_tests {
+    #[test]
+    fn dispatches_past_the_host_limit_do_not_fit() {
+        assert!(super::dispatch_fits(65_535, 65_535, 65_535));
+        assert!(super::dispatch_fits(0, 0, 0));
+        assert!(!super::dispatch_fits(65_536, 1, 1));
+        assert!(!super::dispatch_fits(1, u32::MAX, 1));
+        assert!(!super::dispatch_fits(1, 1, 65_536));
+    }
 }
