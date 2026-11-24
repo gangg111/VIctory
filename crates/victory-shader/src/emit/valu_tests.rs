@@ -85,13 +85,17 @@ fn build_valu_cs_wave(body: &[u32], wave64: bool) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
-    lower_cs(&words)
+    lower_cs_wave(&words, wave64)
 }
 
 /// Lowers `words` as a 1-thread compute program with [`build_valu_cs`]'s
 /// layout: 4 root constants in `s0..s3`, the address of a table holding a
 /// UAV in `s4`.
 fn lower_cs(words: &[u32]) -> HostShader {
+    lower_cs_wave(words, false)
+}
+
+fn lower_cs_wave(words: &[u32], wave64: bool) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
