@@ -3866,9 +3866,12 @@ impl<'a> Lower<'a> {
                 .and_then(|i| i.reads.iter().find(|r| matches!(r.0, Reg::V(_))))
                 .map_or(v, |r| r.1)
         };
-        let same = |b: &Address| {
+        // The other load's entry starts `4 * first` bytes into it; this load
+        // must start at that same entry (fuzeofficlal's review of #1130), and
+        // then reads it from its own dword 0.
+        let same = |b: &Address, first: u8| {
             b.param == a.param
-                && b.offset == a.offset
+                && b.offset.wrapping_add(4 * u32::from(first)) == a.offset
                 && match (a.dynamic, b.dynamic) {
                     (None, None) => true,
                     (Some(x), Some(y)) => x == y || lane(x) == lane(y),
@@ -3883,9 +3886,10 @@ impl<'a> Lower<'a> {
             .find_map(|d| {
                 d.source.leaves().into_iter().find_map(|l| match *l {
                     Source::Loaded { load, first }
-                        if load != site && self.scalar.get(&load).is_some_and(same) =>
+                        if load != site
+                            && self.scalar.get(&load).is_some_and(|b| same(b, first)) =>
                     {
-                        Some((d.site, first))
+                        Some((d.site, 0))
                     }
                     _ => None,
                 })
