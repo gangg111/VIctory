@@ -729,10 +729,15 @@ impl State {
             for u in &t.host.user_data {
                 let v = self.user_dword(compute, u);
                 let _ = write!(text, " u{}={v:#x}", u.index);
-                let index = if u.root == RootType::Table { v / 32 } else { v };
-                if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
-                    let _ = write!(text, " [heap {index}: {slot}]");
+                #[cfg(feature = "diagnostics")]
+                {
+                    let index = if u.root == RootType::Table { v / 32 } else { v };
+                    if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
+                        let _ = write!(text, " [heap {index}: {slot}]");
+                    }
                 }
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = views;
             }
             for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
@@ -742,6 +747,7 @@ impl State {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
         let _ = write!(text, " tables {:?}", self.reads(compute));
         text
     }

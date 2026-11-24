@@ -60,8 +60,17 @@ impl Pending {
     }
 
     fn make(&self) {
+        let started = Instant::now();
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        // A slow one names its shaders: translation and the driver's compile
+        // together, so a pathological program shows up in the log.
+        let ms = started.elapsed().as_millis();
+        if ms >= 1000 {
+            let shaders: Vec<String> =
+                self.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+            tracing::warn!(ms, made = self.made.get().is_some_and(Option::is_some), ?shaders, "slow pipeline");
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
