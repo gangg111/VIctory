@@ -77,6 +77,9 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Whether the last [`State::bind`] left a used unordered access view
+    /// with nothing behind it (a null view).
+    null_uav: bool,
 }
 
 impl Drop for State {
@@ -117,6 +120,31 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// dispatch). A count past it is undefined behaviour on the host; drivers
 /// may run it for seconds and reset the display driver.
 const MAX_GROUPS: u32 = 65_535;
+
+/// Whether dispatches that write through a null unordered access view are
+/// dropped (the default; `VICTORY_NULL_UAV_DISPATCH=1` runs them). Reads of
+/// a null view give zeros and its atomics return zero, so a compute pass
+/// that loops on a counter or flag kept there (work queues, spin waits)
+/// never sees it move and runs to the translator's loop limit in every
+/// lane: seconds of GPU time, and the host resets the display driver
+/// (DXGI_ERROR_DEVICE_HUNG, 2026-11-24, in the world on an RX 7600; the
+/// device-removed data named a dispatch with two null views in its table).
+/// shortcut: what such a pass writes to its other views is lost too.
+fn skip_null_uav_dispatches() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| std::env::var_os("VICTORY_NULL_UAV_DISPATCH").is_none_or(|v| v != "1"))
+}
+
+/// Logs, once per pipeline, a dispatch dropped for a null unordered access
+/// view.
+fn null_uav_dropped(pipeline: &str) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 256 && !seen.iter().any(|s| s == pipeline) {
+        seen.push(pipeline.to_owned());
+        tracing::warn!(pipeline, "a dispatch writing through a null unordered access view dropped");
+    }
+}
 
 /// Whether the host can run a dispatch of `x * y * z` groups.
 fn dispatch_fits(x: u32, y: u32, z: u32) -> bool {
@@ -414,6 +442,7 @@ impl State {
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        self.null_uav = false;
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -529,6 +558,11 @@ impl State {
             return;
         }
         self.bind(list, p, true);
+        if self.null_uav && skip_null_uav_dispatches() {
+            null_uav_dropped(&p.name);
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -610,7 +644,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -621,8 +655,9 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+        match host.mirror(index, handle, true) {
+            Some(view) => readable(list, u, &view),
+            None => self.null_uav |= u.kind == ResourceType::Uav,
         }
     }
 
@@ -708,8 +743,9 @@ impl State {
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                    match crate::descriptor::view(handle) {
+                        Some(view) => readable(list, u, &view),
+                        None => self.null_uav |= u.kind == ResourceType::Uav,
                     }
                 }
                 made.push((slot, first * 32));
@@ -743,8 +779,9 @@ impl State {
                     }
                     None => {
                         host.make_null(index);
-                        if used.is_some() {
+                        if let Some(u) = used {
                             once!(slot, "a table entry without a view");
+                            self.null_uav |= u.kind == ResourceType::Uav;
                         }
                     }
                 }
@@ -1010,7 +1047,11 @@ impl State {
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => {
                     self.bind(list, p, true);
-                    true
+                    let skip = self.null_uav && skip_null_uav_dispatches();
+                    if skip {
+                        null_uav_dropped(&p.name);
+                    }
+                    !skip
                 }
                 _ => false,
             },
