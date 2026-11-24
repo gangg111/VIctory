@@ -1216,7 +1216,17 @@ fn describe(view: Option<&View>) -> String {
                 };
                 format!("buffer {:?} f{f}", crate::descriptor::host::buffer_range(v))
             }),
-        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
+        Some(v @ View::Unordered(r, _, d)) => match texture(*r as This) {
+            Some(t) => format!("uav {t}"),
+            // LOKALNA DIAGNOSTYKA (gpu-189): UAV bufora: format, stride i flagi opisu tytulu
+            // (slowa D3D12_UNORDERED_ACCESS_VIEW_DESC: 0 format, 1 wymiar, 2..3 pierwszy element,
+            // 4 liczba, 5 stride, 8 flagi).
+            None => format!(
+                "uav buffer {:?} desc {:?}",
+                crate::descriptor::host::buffer_range(v),
+                d.map(|d| (crate::resource::pc_format(d[0]), d[1], d[4], d[5], d[8]))
+            ),
+        },
         Some(View::Placed(u, r, d)) => {
             let base = u64::from(d[10]) | u64::from(d[11]) << 32;
             let width = u64::from(r[4]) | u64::from(r[5]) << 32;
