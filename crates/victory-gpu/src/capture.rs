@@ -19,6 +19,21 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
+    // LOKALNA DIAGNOSTYKA (gpu-189): VICTORY_CAPTURE_AFTER_WORLD=100,250 to klatki liczone od
+    // pierwszej klatki swiata (pierwszej z co najmniej 1000 rysowaniami na hoscie), bo numery
+    // klatek roznia sie miedzy przebiegami o kilkaset.
+    static AFTER: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let after = AFTER.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_AFTER_WORLD")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|f| f.trim().parse().ok())
+            .collect()
+    });
+    let world = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+    if world > 0 && n > world && after.contains(&(n - world)) {
+        return true;
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
@@ -27,6 +42,21 @@ pub(crate) fn listed(n: u64) -> bool {
             .collect()
     })
     .contains(&n)
+}
+
+/// The first world frame (see [`listed`]), 0 before it.
+static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// At each present: notes the first frame that ran 1000 or more host draws.
+pub(crate) fn frame_done(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::draw::drawn();
+    let drawn = now - LAST.swap(now, Relaxed);
+    if drawn >= 1000 && WORLD.load(Relaxed) == 0 {
+        WORLD.store(frame, Relaxed);
+        tracing::info!(frame, drawn, "world starts (first frame with 1000 or more host draws)");
+    }
 }
 
 /// Whether frame `n` is saved.
