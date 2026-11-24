@@ -210,7 +210,7 @@ fn emit_cs(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, Shade
     let dxbc = empty_dxbc();
     let container = Container::parse(&dxbc)?;
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
+    let res = resource::track(&p, &native.layout, native.stage, None)?;
     let io_res = io::raise(&p, native)?;
     let st = structure::structure(&p)?;
     emit_with(
